@@ -1,0 +1,16 @@
+venv/
+__pycache__/
+*.py[cod]
+*.sqlite3
+.env
+
+# Django
+staticfiles/
+media/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
