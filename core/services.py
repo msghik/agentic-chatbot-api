@@ -63,15 +63,28 @@ def run_django_agent(user_prompt: str) -> dict:
         audit.tool_arguments = clean_args
 
         # Look up the definition directly in the database
+# Look up the definition directly in the database
         try:
             target_tool = AgentTool.objects.get(name=call.name)
+            
+            # PATH-ROUTING FIX: If the URL ends with a trailing slash and we have a single argument,
+            # append it to the path instead of sending it as a query parameter (ideal for REST Countries)
+            execution_url = target_tool.url
+            request_args = clean_args.copy()
+            
+            if execution_url.endswith("/") and len(request_args) == 1:
+                val = list(request_args.values())[0]
+                execution_url = f"{execution_url}{val}"
+                request_args = {} # Clear query args since it's now in the path
+
             if target_tool.method == "GET":
-                api_res = requests.get(target_tool.url, params=clean_args, timeout=10)
+                api_res = requests.get(execution_url, params=request_args, timeout=10)
             else:
-                api_res = requests.post(target_tool.url, json=clean_args, timeout=10)
+                api_res = requests.post(execution_url, json=request_args, timeout=10)
 
             api_res.raise_for_status()
             api_data = api_res.json()
+            
         except Exception as e:
             api_data = {"error": f"API Request Failed: {str(e)}"}
             audit.status = "ERROR"
