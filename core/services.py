@@ -1,9 +1,7 @@
 # core/services.py
 import os
 import requests
-from google import genai
-from google.genai import types
-from google.genai.errors import APIError
+import json
 from .models import AgentTool, AgentAuditLog
 
 def run_django_agent(user_prompt: str) -> dict:
@@ -16,56 +14,101 @@ def run_django_agent(user_prompt: str) -> dict:
     # 1. Initialize the Audit Log Session
     audit = AgentAuditLog.objects.create(user_prompt=user_prompt)
 
-    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
     db_tools = AgentTool.objects.filter(is_active=True)
 
-    declarations = [
-        types.FunctionDeclaration(
-            name=t.name, description=t.description, parameters_json_schema=t.parameters_schema
-        ) for t in db_tools
-    ]
-    gemma_tools = [types.Tool(function_declarations=declarations)] if declarations else None
+    # Format tools for LM Studio payload
+    tools = []
+    for t in db_tools:
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters_schema
+            }
+        })
 
-    config = types.GenerateContentConfig(
-        system_instruction=(
-            "You are an autonomous API agent helper. Analyze the user request. "
-            "If an applicable database tool matches the intent, call it with appropriate arguments. "
-            "Once you receive the structural results, translate them back into an elegant, conversational breakdown."
-        ),
-        tools=gemma_tools,
-        temperature=0.0,
-        thinking_config=types.ThinkingConfig(thinking_level="HIGH")
+    lm_studio_url = "http://localhost:1234/api/v1/chat"
+    system_prompt = (
+        "You are an autonomous API agent helper. Analyze the user request. "
+        "If an applicable database tool matches the intent, call it with appropriate arguments. "
+        "Once you receive the structural results, translate them back into an elegant, conversational breakdown."
     )
+
+    payload = {
+        "model": "gemma-4-e2b-it",
+        "system_prompt": system_prompt,
+        "input": user_prompt,
+    }
+    if tools:
+        payload["tools"] = tools
 
     # 2. First Execution Turn (Intent Analysis & Tool Routing)
     try:
-        response = client.models.generate_content(
-            model="gemma-4-31b-it", contents=user_prompt, config=config
+        res = requests.post(
+            lm_studio_url,
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=10
         )
+        res.raise_for_status()
+        response_data = res.json()
     except Exception as e:
         audit.status = "ERROR"
-        audit.error_message = f"Gemma API Turn 1 Error: {str(e)}"
+        audit.error_message = f"LM Studio API Turn 1 Error: {str(e)}"
         audit.save()
         return {"response": "⚠️ Service temporarily unavailable.", "log_id": audit.id}
 
     # 3. Handle Tool Execution Layer if Gemma decides to call an API
-    if response.function_calls:
+
+    # Try different known tool call locations
+    function_calls = response_data.get("function_calls", [])
+    if not function_calls and "tool_calls" in response_data:
+        function_calls = response_data["tool_calls"]
+    if not function_calls and "choices" in response_data and len(response_data["choices"]) > 0:
+        message = response_data["choices"][0].get("message", {})
+        if "tool_calls" in message:
+            function_calls = message["tool_calls"]
+        elif "function_calls" in message:
+            function_calls = message["function_calls"]
+
+    if function_calls:
         # For simplicity, we track the first tool call in the audit log
-        call = response.function_calls[0]
-        clean_args = dict(call.args)
+        call = function_calls[0]
+
+        call_name = ""
+        clean_args = {}
+
+        if "function" in call:
+            call_name = call["function"]["name"]
+            try:
+                args_str = call["function"].get("arguments", "{}")
+                if isinstance(args_str, dict):
+                    clean_args = args_str
+                else:
+                    clean_args = json.loads(args_str)
+            except json.JSONDecodeError:
+                clean_args = {}
+        else:
+            call_name = call.get("name", "")
+            clean_args = call.get("args", {})
+            if isinstance(clean_args, str):
+                try:
+                    clean_args = json.loads(clean_args)
+                except json.JSONDecodeError:
+                    clean_args = {}
 
         # Typosquatting fix: Handle common dropped leading characters
         if "ongitude" in clean_args and "longitude" not in clean_args:
             clean_args["longitude"] = clean_args.pop("ongitude")
 
         # Update Audit Log with Intent
-        audit.tool_called = call.name
+        audit.tool_called = call_name
         audit.tool_arguments = clean_args
 
         # Look up the definition directly in the database
-# Look up the definition directly in the database
         try:
-            target_tool = AgentTool.objects.get(name=call.name)
+            target_tool = AgentTool.objects.get(name=call_name)
             
             # PATH-ROUTING FIX: If the URL ends with a trailing slash and we have a single argument,
             # append it to the path instead of sending it as a query parameter (ideal for REST Countries)
@@ -94,26 +137,45 @@ def run_django_agent(user_prompt: str) -> dict:
 
         # 4. Second Execution Turn (Feeding data payload back to the model for translation)
         try:
-            final_turn = client.models.generate_content(
-                model="gemma-4-31b-it",
-                contents=[
-                    types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)]),
-                    response.candidates[0].content,  # Historical context of original tool request
-                    types.Content(role="user", parts=[
-                        types.Part.from_function_response(
-                            name=call.name, 
-                            response={"result": api_data}
-                        )
-                    ])
-                ],
-                config=config  # Re-inject instructions and tools so Turn 2 parsing succeeds
+            # We append the tool execution result to the user prompt directly
+            second_turn_prompt = (
+                f"Original Request: {user_prompt}\n"
+                f"Tool Used: {call_name}\n"
+                f"Tool Result: {json.dumps(api_data)}\n"
+                "Please provide a final conversational breakdown based on these results."
             )
-            audit.final_response = final_turn.text
+
+            payload_turn2 = {
+                "model": "gemma-4-e2b-it",
+                "system_prompt": system_prompt,
+                "input": second_turn_prompt,
+            }
+            if tools:
+                payload_turn2["tools"] = tools
+
+            res2 = requests.post(
+                lm_studio_url,
+                headers={"Content-Type": "application/json"},
+                json=payload_turn2,
+                timeout=10
+            )
+            res2.raise_for_status()
+            final_turn_data = res2.json()
+
+            final_text = ""
+            if "response" in final_turn_data:
+                final_text = final_turn_data["response"]
+            elif "choices" in final_turn_data and len(final_turn_data["choices"]) > 0:
+                final_text = final_turn_data["choices"][0].get("message", {}).get("content", "")
+            else:
+                final_text = final_turn_data.get("text", "")
+
+            audit.final_response = final_text
             # If an upstream API request failed earlier, keep the status as ERROR but save the text explanation
             if audit.status != "ERROR":
                 audit.status = "SUCCESS"
             audit.save()
-            return {"response": final_turn.text, "log_id": audit.id}
+            return {"response": final_text, "log_id": audit.id}
 
         except Exception as e:
             audit.status = "ERROR"
@@ -122,6 +184,14 @@ def run_django_agent(user_prompt: str) -> dict:
             return {"response": "⚠️ Failed to finalize explanation.", "log_id": audit.id}
 
     # 5. Standard Text Response (No tools triggered)
-    audit.final_response = response.text
+    final_text = ""
+    if "response" in response_data:
+        final_text = response_data["response"]
+    elif "choices" in response_data and len(response_data["choices"]) > 0:
+        final_text = response_data["choices"][0].get("message", {}).get("content", "")
+    else:
+        final_text = response_data.get("text", "")
+
+    audit.final_response = final_text
     audit.save()
-    return {"response": response.text, "log_id": audit.id}
+    return {"response": final_text, "log_id": audit.id}
